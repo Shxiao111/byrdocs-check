@@ -1,13 +1,15 @@
 use rusoto_core::HttpClient;
 use rusoto_s3::S3;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use tokio::{
     self,
     io::{AsyncReadExt, BufReader},
 };
 
-use byrdocs_check::{get_env, get_optional_env, metadata::*};
+use byrdocs_check::{get_env, metadata::*};
+
+const IGNORE_ISBN_CHECK_LIST_FILE: &str = "ignore-isbn-check-list.yml";
 
 struct Input {
     metadata_dir: String,
@@ -74,7 +76,7 @@ enum Status {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let input = Input::new();
-    let mut isbn_check = IsbnCheck::from_env()?;
+    let mut isbn_check = IsbnCheck::from_metadata_dir(Path::new(&input.metadata_dir))?;
 
     let end_point = input.r2_endpoint;
     let http_client = HttpClient::new()?;
@@ -221,60 +223,59 @@ async fn list_all_objects(client: &rusoto_s3::S3Client, bucket_name: &str) -> Ve
 #[derive(Default)]
 struct IsbnCheck {
     allowed_duplicates: Vec<(isbn::Isbn13, HashSet<String>)>,
-    seen: Vec<(isbn::Isbn13, HashSet<String>)>,
+    seen: Vec<(isbn::Isbn13, Vec<SeenIsbnFile>)>,
+}
+
+#[derive(Clone)]
+struct SeenIsbnFile {
+    md5: String,
+    file_name: String,
 }
 
 impl IsbnCheck {
-    fn from_env() -> anyhow::Result<Self> {
-        let Some(value) = get_optional_env("IGNORE_ISBN_CHECK_LIST") else {
-            return Ok(Self::default());
+    fn from_metadata_dir(metadata_dir: &Path) -> anyhow::Result<Self> {
+        let config_path = metadata_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(IGNORE_ISBN_CHECK_LIST_FILE);
+        let value = match std::fs::read_to_string(&config_path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error).context(format!(
+                    "Failed to read ISBN duplicate list at {}",
+                    config_path.display()
+                )));
+            }
         };
-        Self::parse(&value)
+        Self::parse_yaml(&value).map_err(|error| {
+            error.context(format!(
+                "Invalid ISBN duplicate list at {}",
+                config_path.display()
+            ))
+        })
     }
 
-    fn parse(value: &str) -> anyhow::Result<Self> {
+    fn parse_yaml(value: &str) -> anyhow::Result<Self> {
         let mut check = Self::default();
-        let entries: Vec<_> = value.split(';').collect();
-        for (entry_index, entry) in entries.iter().enumerate() {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                if entry_index + 1 == entries.len() {
-                    continue;
-                }
-                anyhow::bail!(
-                    "Invalid IGNORE_ISBN_CHECK_LIST: empty entry at position {}",
-                    entry_index + 1
-                );
+        let entries = serde_yaml::from_str::<Option<BTreeMap<String, Vec<String>>>>(value)?
+            .unwrap_or_default();
+        for (isbn_value, md5_values) in entries {
+            let isbn = isbn_value
+                .parse::<isbn::Isbn13>()
+                .map_err(|error| anyhow::anyhow!("Invalid ISBN {:?}: {}", isbn_value, error))?;
+            if md5_values.is_empty() {
+                anyhow::bail!("No MD5 values provided for ISBN {:?}", isbn_value);
             }
-
-            let (isbn_value, md5_values) = entry.split_once(':').ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Invalid IGNORE_ISBN_CHECK_LIST entry {:?}: expected <ISBN>:<MD5>[,<MD5>...]",
-                    entry
-                )
-            })?;
-            if md5_values.contains(':') {
-                anyhow::bail!(
-                    "Invalid IGNORE_ISBN_CHECK_LIST entry {:?}: expected one ':'",
-                    entry
-                );
-            }
-
-            let isbn = isbn_value.trim().parse::<isbn::Isbn13>().map_err(|error| {
-                anyhow::anyhow!(
-                    "Invalid ISBN in IGNORE_ISBN_CHECK_LIST entry {:?}: {}",
-                    entry,
-                    error
-                )
-            })?;
             let hashes = check.hashes_for_isbn_mut(isbn);
-            for hash in md5_values.split(',') {
-                let hash = hash.trim();
+            for hash in md5_values {
                 if hash.len() != 32 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                     anyhow::bail!(
-                        "Invalid MD5 {:?} in IGNORE_ISBN_CHECK_LIST entry {:?}: expected 32 hexadecimal characters",
+                        "Invalid MD5 {:?} for ISBN {:?}: expected 32 hexadecimal characters",
                         hash,
-                        entry
+                        isbn_value
                     );
                 }
                 hashes.insert(hash.to_ascii_lowercase());
@@ -296,7 +297,12 @@ impl IsbnCheck {
         &mut self.allowed_duplicates.last_mut().unwrap().1
     }
 
-    fn record(&mut self, isbn: isbn::Isbn13, md5: &str) -> bool {
+    fn record(
+        &mut self,
+        isbn: isbn::Isbn13,
+        md5: &str,
+        file_name: &str,
+    ) -> Option<Vec<SeenIsbnFile>> {
         let md5 = md5.to_ascii_lowercase();
         let seen_index = self
             .seen
@@ -309,17 +315,36 @@ impl IsbnCheck {
         let allowed = allowed_index.map(|index| &self.allowed_duplicates[index].1);
 
         if let Some(index) = seen_index {
-            let seen_hashes = &mut self.seen[index].1;
-            let is_new_hash = !seen_hashes.contains(&md5);
-            let duplicate_is_allowed = is_new_hash
-                && allowed.is_some_and(|allowed| {
-                    allowed.contains(&md5) && seen_hashes.iter().all(|hash| allowed.contains(hash))
-                });
-            seen_hashes.insert(md5);
-            !is_new_hash || duplicate_is_allowed
+            let seen_files = &mut self.seen[index].1;
+            if seen_files.iter().any(|seen_file| seen_file.md5 == md5) {
+                return None;
+            }
+
+            let duplicate_is_allowed = allowed.is_some_and(|allowed| {
+                allowed.contains(&md5)
+                    && seen_files
+                        .iter()
+                        .all(|seen_file| allowed.contains(&seen_file.md5))
+            });
+            let conflicts = if duplicate_is_allowed {
+                None
+            } else {
+                Some(seen_files.clone())
+            };
+            seen_files.push(SeenIsbnFile {
+                md5,
+                file_name: file_name.to_owned(),
+            });
+            conflicts
         } else {
-            self.seen.push((isbn, HashSet::from([md5])));
-            true
+            self.seen.push((
+                isbn,
+                vec![SeenIsbnFile {
+                    md5,
+                    file_name: file_name.to_owned(),
+                }],
+            ));
+            None
         }
     }
 }
@@ -340,7 +365,15 @@ async fn check(
     let data = &metadata.data;
     if let Err(e) = match data {
         Data::Test(test) => check_test(test),
-        Data::Book(book) => check_book(book, md5, isbn_check),
+        Data::Book(book) => check_book(
+            book,
+            md5,
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .as_ref(),
+            isbn_check,
+        ),
         Data::Doc(doc) => check_doc(doc),
     } {
         errors.push(e);
@@ -421,7 +454,12 @@ async fn check(
     }
 }
 
-fn check_book(book: &Book, md5: &str, isbn_check: &mut IsbnCheck) -> anyhow::Result<()> {
+fn check_book(
+    book: &Book,
+    md5: &str,
+    file_name: &str,
+    isbn_check: &mut IsbnCheck,
+) -> anyhow::Result<()> {
     let mut errors = Vec::new();
     if book.authors.len() == 0 {
         errors.push(anyhow::anyhow!("应当至少有一个作者"));
@@ -436,8 +474,17 @@ fn check_book(book: &Book, md5: &str, isbn_check: &mut IsbnCheck) -> anyhow::Res
         .iter()
         .for_each(|isbn| match isbn.parse::<isbn::Isbn13>() {
             Ok(isbn) => {
-                if !isbn_check.record(isbn, md5) {
-                    errors.push(anyhow::anyhow!("重复的isbn. md5: {}", md5));
+                if let Some(conflicting_files) = isbn_check.record(isbn, md5, file_name) {
+                    let mut file_descriptions: Vec<_> = conflicting_files
+                        .iter()
+                        .map(|file| file.file_name.as_str())
+                        .collect();
+                    file_descriptions.push(file_name);
+                    errors.push(anyhow::anyhow!(
+                        "重复的isbn {}. 冲突文件: {}",
+                        isbn.hyphenate().unwrap().as_str(),
+                        file_descriptions.join(", ")
+                    ));
                 }
             }
             Err(e) => {
@@ -560,32 +607,73 @@ fn check_doc(doc: &Doc) -> anyhow::Result<()> {
 mod test {
     #[test]
     fn allows_only_collisions_whose_hashes_are_all_listed() {
-        let config =
-            "9787030822918:9c2b102e98f95fdf8fa53cfe98490ed1,a688a38c921cfe3b940175a9b047e941;";
-        let mut forward = super::IsbnCheck::parse(config).unwrap();
+        let config = r#"
+"9787030822918":
+  - 9c2b102e98f95fdf8fa53cfe98490ed1
+  - a688a38c921cfe3b940175a9b047e941
+"#;
+        let mut forward = super::IsbnCheck::parse_yaml(config).unwrap();
         let isbn = "9787030822918".parse().unwrap();
-        assert!(forward.record(isbn, "9c2b102e98f95fdf8fa53cfe98490ed1"));
-        assert!(forward.record(isbn, "a688a38c921cfe3b940175a9b047e941"));
-        assert!(!forward.record(isbn, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert!(
+            forward
+                .record(isbn, "9c2b102e98f95fdf8fa53cfe98490ed1", "first.yml")
+                .is_none()
+        );
+        assert!(
+            forward
+                .record(isbn, "a688a38c921cfe3b940175a9b047e941", "second.yml")
+                .is_none()
+        );
+        let conflicts = forward
+            .record(isbn, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "third.yml")
+            .unwrap();
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].file_name, "first.yml");
+        assert_eq!(conflicts[1].file_name, "second.yml");
 
-        let mut reverse = super::IsbnCheck::parse(config).unwrap();
-        assert!(reverse.record(isbn, "a688a38c921cfe3b940175a9b047e941"));
-        assert!(reverse.record(isbn, "9c2b102e98f95fdf8fa53cfe98490ed1"));
-        assert!(!reverse.record(isbn, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        let mut reverse = super::IsbnCheck::parse_yaml(config).unwrap();
+        assert!(
+            reverse
+                .record(isbn, "a688a38c921cfe3b940175a9b047e941", "second.yml")
+                .is_none()
+        );
+        assert!(
+            reverse
+                .record(isbn, "9c2b102e98f95fdf8fa53cfe98490ed1", "first.yml")
+                .is_none()
+        );
+        assert!(
+            reverse
+                .record(isbn, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "third.yml")
+                .is_some()
+        );
 
-        let mut unlisted_first = super::IsbnCheck::parse(config).unwrap();
-        assert!(unlisted_first.record(isbn, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-        assert!(!unlisted_first.record(isbn, "9c2b102e98f95fdf8fa53cfe98490ed1"));
+        let mut unlisted_first = super::IsbnCheck::parse_yaml(config).unwrap();
+        assert!(
+            unlisted_first
+                .record(isbn, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "third.yml")
+                .is_none()
+        );
+        let conflicts = unlisted_first
+            .record(isbn, "9c2b102e98f95fdf8fa53cfe98490ed1", "first.yml")
+            .unwrap();
+        assert_eq!(conflicts[0].file_name, "third.yml");
     }
 
     #[test]
-    fn parses_ignore_isbn_check_list_and_validates_md5s() {
-        let config =
-            super::IsbnCheck::parse(" 9787030822918 : 9C2B102E98F95FDF8FA53CFE98490ED1 ;").unwrap();
+    fn parses_yaml_config_and_validates_isbn_and_md5s() {
+        let config = super::IsbnCheck::parse_yaml(
+            r#""9787030822918": ["9C2B102E98F95FDF8FA53CFE98490ED1"]"#,
+        )
+        .unwrap();
         let allowed = &config.allowed_duplicates[0].1;
         assert!(allowed.contains("9c2b102e98f95fdf8fa53cfe98490ed1"));
-        assert!(super::IsbnCheck::parse("9787030822918:not-an-md5").is_err());
-        assert!(super::IsbnCheck::parse("9787030822918:").is_err());
+        assert!(super::IsbnCheck::parse_yaml(r#""9787030822918": ["not-an-md5"]"#).is_err());
+        assert!(super::IsbnCheck::parse_yaml(r#""9787030822918": []"#).is_err());
+        assert!(
+            super::IsbnCheck::parse_yaml(r#""not-an-isbn": ["9c2b102e98f95fdf8fa53cfe98490ed1"]"#)
+                .is_err()
+        );
     }
 
     #[test]
